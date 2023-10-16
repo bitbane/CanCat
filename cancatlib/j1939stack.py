@@ -1024,6 +1024,101 @@ class J1939Interface(cancatlib.CanInterface):
 
         '''
 
+    def J1939_NetworkInfo(self):
+        '''
+        Prints useful information about the J1939 network and data flows.
+        '''
+
+        # Create the dataflows data structure which has all source addresses as primary keys
+        # and contains the destination addresses that data is sent to and which PGNs and the number
+        # of messages sent to each destination
+        dataflows = {}
+        for msg in self.genCanMsgs():
+            edp = msg[2][2]
+            dp = msg[2][3]
+            pf = msg[2][4]
+            ps = msg[2][5]
+            sa = msg[2][6]
+
+            if sa not in dataflows:
+                dataflows[sa] = {}
+
+            # Find the PGN and Destination Address
+            pgn = 0
+            da = 0
+            # Format one (specific) message - PGN is PF * 0x100 and PS is the destination address
+            if pf < 0xF0:
+                pgn = pf * 0x100
+                da = ps
+           # Format two (Global) message - PGN is PF + PS, destination address is 0xFF (implied)
+            else:
+                pgn = (pf * 0x100) + ps
+                da = 0xFF
+
+            if da not in dataflows[sa]:
+                dataflows[sa][da] = {}
+            if pgn not in dataflows[sa][da]:
+                dataflows[sa][da][pgn] = 0
+            dataflows[sa][da][pgn] += 1
+ 
+        # Create a sorted list of all source addresses
+        saddrs = [] 
+        for key in dataflows.keys():
+            saddrs.append(key)
+        saddrs.sort()
+
+        print("---------------------------------------------")
+        print("| The following source addresses sent data: |")
+        print("---------------------------------------------")
+        print("\nADDR   NAME")
+        for sa in saddrs:
+            if(sa in J1939SATabledb):
+                print("0x%02x - %s" % (sa, J1939SATabledb[sa]))
+            else:
+                print("0x%02x - %s" % (sa, "Unknown"))
+
+        print("")
+        print("---------------------------------------")
+        print("| The following data flows were found |")
+        print("---------------------------------------")
+        for sa in saddrs:
+            # Get the source address name
+            sa_name = ""
+            if(sa in J1939SATabledb):
+                sa_name = J1939SATabledb[sa]
+            else:
+                sa_name = "Unknown"
+
+            # Get the destination address name
+            daddrs = []
+            for key in dataflows[sa].keys():
+                daddrs.append(key)
+            daddrs.sort()
+
+            for da in daddrs:
+                da_name = ""
+                if(da in J1939SATabledb):
+                    da_name = J1939SATabledb[da] 
+                else:
+                    da_name = "Unknown"
+
+                print("\nThe following PGNs were sent from %02x - %s to %02x - %s" % (sa, sa_name, da, da_name))
+                for pgn in dataflows[sa][da].keys():
+                    pgn_name = ""
+                    if(pgn in J1939PGNdb):
+                        pgn_name = J1939PGNdb[pgn]['Name']
+                    else:
+                        pgn_name = "Unknown"
+
+                    print("\t%d (%x) - %s (%d)" % (pgn, pgn, pgn_name, dataflows[sa][da][pgn]))
+
+
+
+
+
+
+        
+
 MAX_WORD = 64
 bu_masks = [(2 ** (i)) - 1 for i in range(8*MAX_WORD+1)]
 

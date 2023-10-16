@@ -982,6 +982,26 @@ class J1939(cancatlib.CanInterface):
 
         '''
 
+    def J1939_NetworkInfo(self):
+        '''
+        Prints useful information about the J1939 network.
+        '''
+        saddrs = []
+        for msg in self.genCanMsgs():
+            pf = msg[2][4]
+            ps = msg[2][5]
+            sa = msg[2][6]
+            if sa not in saddrs:
+                saddrs.append(sa)
+
+        print("The following source addresses sent data: ")
+        for sa in saddrs.sort():
+            print(hex(sa))
+
+
+
+
+
 MAX_WORD = 64
 bu_masks = [(2 ** (i)) - 1 for i in range(8*MAX_WORD+1)]
 

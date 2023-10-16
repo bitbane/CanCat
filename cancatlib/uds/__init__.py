@@ -5,6 +5,7 @@ import sys
 import time
 import struct
 import threading
+import math
 
 import cancatlib.iso_tp as cisotp
 
@@ -509,7 +510,8 @@ class UDS(object):
         return []
 
 
-def printUDSSession(c, tx_arbid, rx_arbid=None, paginate=45):
+def printUDSSession(c, tx_arbid, rx_arbid=None, paginate=45, ignore_tp=True, uds_service=None):
+    uds_services = []
     if rx_arbid is None:
         rx_arbid = tx_arbid + 8  # by UDS spec
 
@@ -521,13 +523,132 @@ def printUDSSession(c, tx_arbid, rx_arbid=None, paginate=45):
     while msgs_idx < len(msgs):
         arbid, isotpmsg, count = cisotp.msg_decode(msgs, msgs_idx)
         svc = isotpmsg[0]
-        mtype = (RESP_CODES, UDS_SVCS)[arbid == tx_arbid].get(svc, '')
+        mtype = (RESP_CODES, UDS_SVCS)[arbid[0] == tx_arbid].get(svc, '')
+        if mtype not in uds_services:
+            uds_services.append(mtype)
 
-        print("Message: (%s:%s) \t %-30s %s" % (count, msgs_idx, isotpmsg.encode('hex'), mtype))
+        if (not (ignore_tp and (isotpmsg[0] == 0x3e or isotpmsg[0] == 0x7e))):
+            if (uds_service is None or uds_service == isotpmsg[0]):
+                print("Message: (0x%x) (%s:%s) \t %-30s %s" % (arbid[0], count, msgs_idx, isotpmsg.hex(), mtype))
+                linect += 1
         msgs_idx += count
 
         if paginate:
             if linect % paginate == 0:
                 input("%x)  PRESS ENTER" % linect)
+    
+    print("\nThe following UDS services were seen in this data set")
+    for svc in uds_services:
+        print(svc)
 
-        linect += 1
+
+def saveDataTransfer(c, offset, tx_arbid, rx_arbid, fname):
+    ''' offset is the index of the Request Upload or Request Download message
+        as reported by the printUDSSession routine
+    '''
+    msgs = [msg for msg in c.genCanMsgs(arbids=[tx_arbid, rx_arbid])]
+
+    msgs_idx = offset
+
+    arbid, isotpmsg, count = cisotp.msg_decode(msgs, msgs_idx)
+    print(isotpmsg.hex())
+
+    if(isotpmsg[0] != 0x34 and isotpmsg[0] != 0x35):
+        print("Index %d is not a Request Upload or Request Download message" % msgs_idx)
+        return
+
+    # Check for encryption and compression
+    if((isotpmsg[1] & 0x0F) > 0):
+        print("Encryption in use: %x" % isotpmsg[1] & 0xF)
+    else:
+        print("No Encryption is in use")
+
+    if((isotpmsg[1] & 0xF0) > 0):
+        print("Compression in use: %x" % (isotpmsg[1] & 0xF0) >> 4)
+    else:
+        print("No Compression in use")
+
+    # Get memory addresses and data sizes
+    mem_addr_numbytes = isotpmsg[2] & 0x0F
+    mem_size_numbytes = (isotpmsg[2] & 0xF0) >> 4
+    mem_addr = 0
+    mem_size = 0
+    for i in range(0, mem_addr_numbytes):
+        mem_addr = mem_addr << 8
+        mem_addr = mem_addr + isotpmsg[3 + i]
+    for i in range(0, mem_size_numbytes):
+        mem_size = mem_size << 8
+        mem_size = mem_size + isotpmsg[3 + mem_addr_numbytes + i]
+
+    print("Transferring 0x%x bytes to/from address 0x%08x" % (mem_size, mem_addr))
+
+    # Next message should be a positive response along with block size
+    msgs_idx = msgs_idx + count
+    arbid, isotpmsg, count = cisotp.msg_decode(msgs, msgs_idx)
+
+    if(isotpmsg[0] != 0x74 and isotpmsg[0] != 0x75):
+        print("Did not receive a positive response: ", isotpmsg.hex())
+        return
+
+    blk_size_numbytes = (isotpmsg[1] & 0xF0) >> 4
+    blk_size = 0
+    for i in range(0, blk_size_numbytes):
+        blk_size = blk_size << 8
+        blk_size = blk_size + isotpmsg[2 + i]
+
+    print("Block size is 0x%x" % blk_size)
+
+    # We should start transferring the data here
+    msgs_idx = msgs_idx + count
+    expected_blocks = math.ceil(mem_size / (blk_size - 2))
+    data = bytearray()
+
+    # Loop through each block
+    for block in range(0, expected_blocks):
+        arbid, isotpmsg, count = cisotp.msg_decode(msgs, msgs_idx)
+
+        if(isotpmsg[0] != 0x36):
+            print("Next message is not the transfer data message: ", isotpmsg.hex())
+            return
+        if(isotpmsg[1] != (block + 1) % 256):
+            print("Unexpected block number %x: Expecting %x" % (isotpmsg[1], (block + 1) % 256))
+        
+        data = data + isotpmsg[2:]
+
+        # Typically you get a Response Pending "error" frame after the message is received
+        pos_resp = False
+
+        msgs_idx = msgs_idx + count
+        while(not pos_resp):
+            arbid, isotpmsg, count = cisotp.msg_decode(msgs, msgs_idx)
+
+            if(isotpmsg[0] == 0x76):
+                if(isotpmsg[1] == (block + 1) % 256):
+                    pos_resp = True
+                else:
+                    print("Incorrect block number in positive response. Actual %x Expected: %x", (isotpmsg[0], (block + 1) % 256))
+                    return
+            elif(isotpmsg[0] == 0x7f and isotpmsg[2] == 0x78):
+                msgs_idx = msgs_idx + count
+                continue
+            else:
+                print("Next message is not a positive response or an expected negative response")
+                return
+
+            msgs_idx = msgs_idx + count
+
+    print("Found", hex(len(data)), "Bytes. Expected", hex(mem_size), "Bytes.")
+    if(len(data) != mem_size):
+        print("ACTUAL DATA DOES NOT MATCH EXPECTED DATA")
+        return
+
+    print("Writing data to file", fname)
+    with open(fname, "wb") as binary_file:
+        binary_file.write(data)
+
+
+
+
+
+
+

@@ -1170,6 +1170,46 @@ class CanInterface(object):
                 }
         return savegame
 
+    # Looks for arbids that are sending high-entropy data.  Can optionally discard
+    # a number of bytes, and/or ignore padding bytes
+    def findHighEntropyCanMessages(self, cut_prefix=0, padding_byte=None):
+        '''
+        Looks for arbids that are sending high-entropy data. This is indicative
+        of encryption. Or compression. Or maybe the data is just random...
+        cut_prefix=n discards the first n bytes of data. CAN messages may have something
+        like a counter in the first byte that isn't part of the high-entropy data being sent
+        padding_byte=0xnn CAN messages may be padded if sending less than 8 bytes of data.
+        If padding_byte has a value any bytes that look like padding will be discarded
+        '''
+        can_msgs = {}
+        for msg in self.genCanMsgs():
+            arbid = msg[2][0]
+            data = msg[3]
+            data_len = len(data)
+
+            # In J1939, TP messages have no arbid. Replace it with something that make sense 
+            if(arbid is None):
+                arbid = msg[2][1] << 26 | msg[2][2] << 25 | msg[2][3] << 24 | msg[2][4] << 16 | msg[2][5] << 8 | msg[2][6]
+
+            if(arbid not in can_msgs):
+                can_msgs[arbid] = bytearray()
+
+            # Trim padding bytes
+            if(padding_byte is not None):
+                while data[data_len-1] == padding_byte:
+                    data_len = data_len - 1
+
+            can_msgs[arbid].extend(data[cut_prefix:data_len])
+
+        for arbid in can_msgs.keys():
+            # TODO: Bring analysis in here
+            fname = str(hex(arbid)) + ".bin"
+            with open(fname, "wb") as binary_file:
+                binary_file.write(can_msgs[arbid])
+
+
+
+
     # bookmark subsystem
     def placeCanBookmark(self, name=None, comment=None):
         '''
