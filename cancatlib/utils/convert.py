@@ -87,6 +87,34 @@ def _import_candump(filename):
     return sess
 
 
+def _import_pcan(filename):
+    msgs = []
+    with open(filename, 'rb') as f:
+        pat = re.compile(br'\s*\d+\)\s*(\d+\.\d+)\s*\d*\s*\w*\s*([a-zA-Z0-9]*)\s*\S*\s*\d*\s*([a-zA-Z0-9\s]*)')
+        for line in f.readlines():
+            match = pat.match(line.strip())
+            if match is None:
+                continue
+
+            time, arb_id, data = match.groups()
+            data = data.replace(b' ', b'')
+            # Ensure that the arbid is padded out to 4 bytes
+            if len(arb_id) < 8:
+                arb_id = ('0' * (8 - len(arb_id))) + arb_id
+
+            msgs.append((float(time), unhexlify(arb_id) + unhexlify(data)))
+
+    sess = {
+        'bookmark_info': {},
+        'bookmarks': [],
+        'comments': [],
+        'messages': {
+            cancatlib.CMD_CAN_RECV: msgs,
+        },
+    }
+
+    return sess
+
 def _import_pcap(filename):
     import scapy.layers.l2
     import scapy.packet
@@ -118,6 +146,9 @@ def candump2cancat(candumplog, output):
     with open(output, 'wb') as f:
         pickle.dump(_import_candump(candumplog), f)
 
+def pcan2cancat(pcanlog, output):
+    with open(output, 'wb') as f:
+        pickle.dump(_import_pcan(pcanlog), f)
 
 def pcap2cancat(pcapfile, output):
     with open(output, 'wb') as f:
