@@ -71,7 +71,7 @@ def _import_candump(filename):
 
             # Ensure that the arbid is padded out to 4 bytes
             if len(arb_id) < 8:
-                arb_id = ('0' * (8 - len(arb_id))) + arb_id
+                arb_id = (b'0' * (8 - len(arb_id))) + arb_id
 
             msgs.append((float(time), unhexlify(arb_id) + unhexlify(data)))
 
