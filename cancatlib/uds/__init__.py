@@ -528,13 +528,13 @@ def printUDSSession(c, tx_arbid, rx_arbid=None, paginate=45, ignore_tp=True, uds
     while msgs_idx < len(msgs):
         arbid, isotpmsg, count = cisotp.msg_decode(msgs, msgs_idx)
         svc = isotpmsg[0]
-        mtype = (RESP_CODES, UDS_SVCS)[arbid[0] == tx_arbid].get(svc, '')
+        mtype = (RESP_CODES, UDS_SVCS)[arbid == tx_arbid].get(svc, '')
         if mtype not in uds_services:
             uds_services.append(mtype)
 
         if (not (ignore_tp and (isotpmsg[0] == 0x3e or isotpmsg[0] == 0x7e))):
             if (uds_service is None or isotpmsg[0] in uds_service):
-                print("Message: (0x%x) (%s:%s) \t %-30s %s" % (arbid[0], count, msgs_idx, isotpmsg.hex(), mtype))
+                print("Message: (0x%x) (%s:%s) \t %-30s %s" % (arbid, count, msgs_idx, isotpmsg.hex(), mtype))
                 linect += 1
         msgs_idx += count
 
