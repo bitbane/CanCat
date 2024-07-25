@@ -595,6 +595,8 @@ class CanInterface(object):
         Transmit a CAN message on the attached CAN bus
         Currently returns the *last* result
         '''
+        if(arbid > 0x7ff and extflag == 0):
+            print("WARNING: Arbid is greater than 0x7FF, but extflag is not set!")
 
         msg = struct.pack('>I', arbid) + struct.pack('B', extflag) + self._bytesHelper(message)
 
@@ -617,6 +619,9 @@ class CanInterface(object):
         Transmit an ISOTP can message. tx_arbid is the arbid we're transmitting,
         and rx_arbid is the arbid we're listening for
         '''
+        if(tx_arbid > 0x7ff and extflag == 0):
+            print("WARNING: Arbid is greater than 0x7FF, but extflag is not set!")
+
         msg = struct.pack('>IIB', tx_arbid, rx_arbid, extflag) + message
         for i in range(count):
             self._send(CMD_CAN_SEND_ISOTP, msg)
@@ -666,6 +671,8 @@ class CanInterface(object):
         tx_arbid is the arbid we're transmitting, and rx_arbid
         is the arbid we're listening for
         '''
+        if(tx_arbid > 0x7ff and extflag == 0):
+            print("WARNING: Arbid is greater than 0x7FF, but extflag is not set!")
 
         currIdx = self.getCanMsgCount()
         msg = struct.pack('>II', tx_arbid, rx_arbid) + struct.pack('B', extflag) + self._bytesHelper(message)
@@ -835,7 +842,7 @@ class CanInterface(object):
                         time.sleep(delta)
                 last_time = ts
 
-            self.CANxmit(arbid, data)
+            self.CANxmit(arbid, data, extflag=arbid>0x7ff)
             if timing == TIMING_INTERACTIVE:
                 print("Message transmitted")
 
