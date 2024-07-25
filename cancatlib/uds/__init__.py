@@ -249,9 +249,9 @@ class UDS(object):
     def SendTesterPresent(self):
         while self.TesterPresent is True:
             if self.TesterPresentRequestsResponse:
-                self.c.CANxmit(self.tx_arbid, b"\x02\x3E\x00\x00\x00\x00\x00\x00")
+                self.c.CANxmit(self.tx_arbid, b"\x02\x3E\x00\x00\x00\x00\x00\x00", self.extflag)
             else:
-                self.c.CANxmit(self.tx_arbid, b"\x02\x3E\x80\x00\x00\x00\x00\x00")
+                self.c.CANxmit(self.tx_arbid, b"\x02\x3E\x80\x00\x00\x00\x00\x00", self.extflag)
             time.sleep(2.0)
 
     def StartTesterPresent(self, request_response=True):
@@ -511,6 +511,11 @@ class UDS(object):
 
 
 def printUDSSession(c, tx_arbid, rx_arbid=None, paginate=45, ignore_tp=True, uds_service=None):
+    '''
+    Prints UDS Session information for the given rx/tx arbid.
+    ignore_tp - Ignore Tester Present messages
+    uds_service - specify a specific uds service
+    '''
     uds_services = []
     if rx_arbid is None:
         rx_arbid = tx_arbid + 8  # by UDS spec
@@ -528,7 +533,7 @@ def printUDSSession(c, tx_arbid, rx_arbid=None, paginate=45, ignore_tp=True, uds
             uds_services.append(mtype)
 
         if (not (ignore_tp and (isotpmsg[0] == 0x3e or isotpmsg[0] == 0x7e))):
-            if (uds_service is None or uds_service == isotpmsg[0]):
+            if (uds_service is None or isotpmsg[0] in uds_service):
                 print("Message: (0x%x) (%s:%s) \t %-30s %s" % (arbid[0], count, msgs_idx, isotpmsg.hex(), mtype))
                 linect += 1
         msgs_idx += count
