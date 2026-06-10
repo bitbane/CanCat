@@ -2414,11 +2414,11 @@ def getDeviceFile():
             return port
 
 
-def interactive(port=None, InterfaceClass=CanInterface, intro='', load_filename=None, can_baud=None):
+def interactive(port=None, InterfaceClass=CanInterface, intro='', load_filename=None, can_baud=None, transport='serial', socketcan_iface=None):
     global c
     import atexit
 
-    c = InterfaceClass(port=port, load_filename=load_filename)
+    c = InterfaceClass(port=port, load_filename=load_filename, transport=transport, socketcan_iface=socketcan_iface)
     atexit.register(cleanupInteractiveAtExit)
 
     if load_filename is None:

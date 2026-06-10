@@ -34,6 +34,9 @@ setuptools.setup  (name  = 'cancat',
                 "future",
                 "six",
             ],
+        extras_require = {
+                'socketcan': ['python-can>=3.0.0'],
+            },
         classifiers      = [
                             'Development Status :: 5 - Production/Stable',
                             'Intended Audience :: Telecommunications Industry',
