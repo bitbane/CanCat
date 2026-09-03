@@ -81,28 +81,20 @@ class IsoTpStack(object):
         ff_payload = ff_header + first_chunk
         self._transport.send_raw_can(arbid, ff_payload, extflag=extflag)
 
-        # -- Send Consecutive Frames, respecting flow control ------------------
+        # -- Wait for the initial Flow Control before sending any CFs ----------
+        # Per ISO 15765-2 a Flow Control frame is only expected once per
+        # block: BS (block size) CFs get sent back-to-back (paced by STmin),
+        # and another FC is only awaited after a full block -- not before
+        # every single CF. BS==0 means "no limit", i.e. send everything and
+        # never wait for another FC.
+        if not self._await_flow_control(timeout=2.0):
+            return False
+
+        # -- Send Consecutive Frames, respecting the negotiated block size -----
         block_count = 0
         sn = 1  # sequence number starts at 1 for CF[1]
 
         while offset < total_len:
-            # Wait for the ECU's Flow Control frame before sending more.
-            resp = self._recv_from_ecu(timeout=2.0)
-
-            if resp is not None:
-                arbid_r, frame_data, extflag_r = resp
-                fc_status = self._parse_flow_control(frame_data)
-                if fc_status == ISO_TP_FC_OVERFLOW_ERROR:
-                    print("ISO-TP flow control overflow error", file=sys.stderr)
-                    return False
-                elif fc_status == ISO_TP_FC_WAIT:
-                    # Wait before continuing
-                    continue
-            else:
-                print("ISO-TP: timed out waiting for Flow Control", file=sys.stderr)
-                return False
-
-            # Send Consecutive Frame
             cf_header = struct.pack("B", ISO_TP_CF | (sn & 0x0F))
             cf_payload = cf_header + data[offset:offset + 7]
             self._transport.send_raw_can(arbid, cf_payload, extflag=extflag)
@@ -111,16 +103,56 @@ class IsoTpStack(object):
             sn = (sn + 1) & 0x0F
             block_count += 1
 
-            # Block size check -- must wait for FC if BS is set
-            if self._fc_bs != 0 and block_count >= self._fc_bs:
-                block_count = 0
-
             # Inter-frame delay (STmin conversion)
             st_min_us = self._st_min_to_us(self._fc_st_min or 0)
             if st_min_us > 0:
                 time.sleep(st_min_us / 1e6)
 
+            # Block size check -- only wait for another FC once we've sent
+            # a full block (and there's more data left to send).
+            if self._fc_bs != 0 and block_count >= self._fc_bs and offset < total_len:
+                block_count = 0
+                if not self._await_flow_control(timeout=2.0):
+                    return False
+
         return True
+
+    def _await_flow_control(self, timeout=2.0):
+        """Wait for a Flow Control frame, updating self._fc_bs/_fc_st_min.
+
+        Ignores anything on our rx id that isn't actually PCI-type Flow
+        Control (0x3) -- e.g. a negative response left over from a prior
+        request, or other traffic -- rather than misparsing it as one; that
+        traffic doesn't consume the wait budget for the FC we're actually
+        after. Loops on repeated FC_WAIT frames (the ECU asking for more
+        time before it's ready for the next block/CF), each restarting the
+        wait budget since the ECU explicitly asked for more time. Returns
+        True once a CONTINUE is received; False on timeout or overflow, in
+        which case the caller should abort the transfer.
+        """
+        while True:
+            deadline = time.time() + timeout
+            while True:
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    print("ISO-TP: timed out waiting for Flow Control", file=sys.stderr)
+                    return False
+                resp = self._recv_from_ecu(timeout=remaining)
+                if resp is None:
+                    print("ISO-TP: timed out waiting for Flow Control", file=sys.stderr)
+                    return False
+                _, frame_data, _ = resp
+                if ((frame_data[0] & 0xF0) >> 4) == 0x3:
+                    break
+                # not a Flow Control frame -- ignore and keep waiting
+
+            fc_status = self._parse_flow_control(frame_data)
+            if fc_status == ISO_TP_FC_OVERFLOW_ERROR:
+                print("ISO-TP flow control overflow error", file=sys.stderr)
+                return False
+            if fc_status == ISO_TP_FC_CONTINUE:
+                return True
+            # else FC_WAIT -- loop and wait for the next FC (fresh budget)
 
     def receive(self, timeout=5.0, extflag=False):
         """Wait for and assemble an incoming ISO-TP message.

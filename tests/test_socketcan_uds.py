@@ -128,12 +128,26 @@ class TestSocketcanUdsResponsePending(unittest.TestCase):
         try:
             u = uds.UDS(c, 0x7c0, timeout=2.0, verbose=False)
 
+            def wait_for_nth_frame(arbid, n, deadline):
+                """Wait until at least n frames with this arbid have been sent."""
+                while time.time() < deadline:
+                    if sum(1 for m in FakeCanBus._sent_frames if m.arbitration_id == arbid) >= n:
+                        return True
+                    time.sleep(0.01)
+                return False
+
             def ecu_sim():
                 deadline = time.time() + 2.0
-                while time.time() < deadline:
-                    if any(m.arbitration_id == 0x7c0 for m in FakeCanBus._sent_frames):
-                        break
-                    time.sleep(0.01)
+                # Request is 13 bytes (SID + DID + 10 data bytes) -- multi-frame:
+                # FF, then wait for our FC, then 1 CF. A real ECU can't evaluate
+                # the request (and so can't reply 0x78/positive/negative) until
+                # it has received all of it.
+                if not wait_for_nth_frame(0x7c0, 1, deadline):  # the FF
+                    return
+                FakeCanBus._send_queue.append(FakeCanMessage(0x7c8, bytes.fromhex('3000000000000000')))
+                if not wait_for_nth_frame(0x7c0, 2, deadline):  # the CF
+                    return
+
                 # NRC 0x78 for WriteDataByIdentifier (0x2e)
                 FakeCanBus._send_queue.append(FakeCanMessage(0x7c8, bytes.fromhex('037f2e7800000000')))
                 time.sleep(0.1)

@@ -405,6 +405,39 @@ class TestIsoTpStack(unittest.TestCase):
         ff = self.t._send_log[0][1]
         self.assertEqual((ff[0] & 0xF0) >> 4, 0x1)  # FF type
 
+    def test_send_multiframe_waits_for_fc_only_once_when_bs_is_zero(self):
+        """Regression test: send() must only wait for ONE Flow Control frame
+        for the whole transfer when the ECU's FC says BS=0 (no block size
+        limit) -- it must NOT wait for another FC before every single CF.
+        20 bytes needs a FF + 2 CFs; only one FC is injected, so this hangs
+        (and eventually times out/fails) if the bug regresses."""
+        data = b"\x10\x01" + b"\x48" * 18  # 20 bytes -> FF(6) + CF(7) + CF(7)
+        fc_frame = (0x7E8, struct.pack("BBB", 0x30, 0x00, 0x00), False)  # BS=0, STmin=0
+        self.t.inject_recv(fc_frame)
+
+        result = self.stack.send(0x7DF, data, extflag=False)
+        self.assertTrue(result)
+
+        # FF + 2 CFs sent, and the single injected FC is the only frame the
+        # stack ever tried to receive.
+        self.assertEqual(len(self.t._send_log), 3)
+        cf1 = self.t._send_log[1][1]
+        cf2 = self.t._send_log[2][1]
+        self.assertEqual(cf1[0] & 0x0F, 0x1)  # CF sequence number 1
+        self.assertEqual(cf2[0] & 0x0F, 0x2)  # CF sequence number 2
+
+    def test_send_multiframe_waits_for_fc_per_block_when_bs_is_nonzero(self):
+        """With a block size of 1, the ECU should be asked for a fresh FC
+        before every single CF (BS=1 means "one CF per block")."""
+        data = b"\x10\x01" + b"\x48" * 18  # 20 bytes -> FF(6) + CF(7) + CF(7)
+        # BS=1: send one CF, then wait for another FC before the next one.
+        self.t.inject_recv((0x7E8, struct.pack("BBB", 0x30, 0x01, 0x00), False))
+        self.t.inject_recv((0x7E8, struct.pack("BBB", 0x30, 0x01, 0x00), False))
+
+        result = self.stack.send(0x7DF, data, extflag=False)
+        self.assertTrue(result)
+        self.assertEqual(len(self.t._send_log), 3)  # FF + CF + CF
+
     def test_send_multiframe_handles_overflow_error(self):
         data = b"\x10\x01" + b"\x48" * 20
         
