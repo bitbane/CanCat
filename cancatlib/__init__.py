@@ -389,6 +389,13 @@ class CanInterface(object):
         in-flight IsoTpStack transaction for frames off a single shared
         queue -- otherwise whichever of the two happened to be waiting would
         steal frames (e.g. an ISO-TP First Frame) away from the other.
+
+        Dispatches through self._cmdhandlers the same way the serial _rxtx()
+        loop does, rather than always calling _submitMessage() directly --
+        subclasses (e.g. J1939Interface) register a CMD_CAN_RECV handler to
+        get invoked live as each frame arrives (PGN/TP reassembly, myIDs
+        filtering, ...); without this, socketcan frames would only ever pile
+        up in the generic mailbox and those handlers would never run.
         '''
         sub = self._transport.subscribe() if hasattr(self._transport, 'subscribe') else self._transport
         try:
@@ -403,7 +410,13 @@ class CanInterface(object):
                     arbid, data_bytes, extflag = frame
                     ts = time.time()
                     msg = struct.pack('>I', arbid) + data_bytes
-                    self._submitMessage(CMD_CAN_RECV, (ts, msg))
+                    tsmsg = (ts, msg)
+
+                    cmdhandler = self._cmdhandlers.get(CMD_CAN_RECV)
+                    if cmdhandler is not None:
+                        cmdhandler(tsmsg, self)
+                    else:
+                        self._submitMessage(CMD_CAN_RECV, tsmsg)
                 except Exception as e:
                     if not self._config['shutdown']:
                         print("SocketCAN rx error: %r" % e)
