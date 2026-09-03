@@ -1,6 +1,4 @@
 # CAN bus device mapping tool
-from __future__ import print_function
-
 import sys
 import argparse
 import re
