@@ -13,13 +13,13 @@ import time
 
 
 # ---------------------------------------------------------------------------
-# ISO-TP constants
+# ISO-TP constants (ISO 15765-2 PCI type nibble, top 4 bits of byte 0)
 # ---------------------------------------------------------------------------
 
 ISO_TP_SA    = 0x00   # Single Frame indicator bit position (bits 7-6)
 ISO_TP_FF    = 0x10   # First Frame indicator
-ISO_TP_FC    = 0x20   # Flow Control indicator
-ISO_TP_CF    = 0x30   # Consecutive Frame indicator
+ISO_TP_CF    = 0x20   # Consecutive Frame indicator
+ISO_TP_FC    = 0x30   # Flow Control indicator
 ISO_TP_TS_MASK = 0x0F # Reserved byte / timestamp mask
 
 # Single frame maximum payload (5 bytes type + data)
@@ -45,8 +45,8 @@ class IsoTpStack(object):
 
     def __init__(self, transport, rx_id=None, tx_id=None):
         self._transport = transport
-        self._rx_id = rx_id or 0x7DF   # standard OBD-UAS receiver
-        self._tx_id = tx_id or 0x7E8   # default ECU response address
+        self._rx_id = rx_id or 0x7DF   # arbid we expect the ECU to respond on
+        self._tx_id = tx_id or 0x7E8   # arbid we transmit our own frames on
         self._fc_bs = ISO_TP_BS_DEFAULT
         self._fc_st_min = ISO_TP_DS_SEP_DEFAULT
         self._lock = threading.Lock()
@@ -65,18 +65,29 @@ class IsoTpStack(object):
             return True
 
         # -- Multi-Frame: First Frame ------------------------------------------
-        ff_header = struct.pack("!BH", ISO_TP_FF, total_len)
-        ff_payload = ff_header + data[:6]
+        # ISO 15765-2 packs the length into a 2-byte PCI: the top nibble of
+        # byte 0 is the FF type, the bottom nibble + all of byte 1 hold a
+        # 12-bit length (0-4095), leaving 6 data bytes in the 8-byte frame.
+        # Lengths beyond 4095 use the "escape" form: byte 0/1 = 0x10 0x00
+        # followed by a 4-byte length, leaving only 2 data bytes.
+        if total_len <= 0xFFF:
+            ff_header = struct.pack("BB", ISO_TP_FF | ((total_len >> 8) & 0x0F), total_len & 0xFF)
+            first_chunk = data[:6]
+            offset = 6
+        else:
+            ff_header = struct.pack(">BBI", ISO_TP_FF, 0x00, total_len)
+            first_chunk = data[:2]
+            offset = 2
+        ff_payload = ff_header + first_chunk
         self._transport.send_raw_can(arbid, ff_payload, extflag=extflag)
 
         # -- Send Consecutive Frames, respecting flow control ------------------
-        offset = 6
         block_count = 0
         sn = 1  # sequence number starts at 1 for CF[1]
 
         while offset < total_len:
-            # Wait for next FC before sending more (ECU may send FC)
-            resp = self._transport.recv_raw_can(timeout=2.0)
+            # Wait for the ECU's Flow Control frame before sending more.
+            resp = self._recv_from_ecu(timeout=2.0)
 
             if resp is not None:
                 arbid_r, frame_data, extflag_r = resp
@@ -87,6 +98,9 @@ class IsoTpStack(object):
                 elif fc_status == ISO_TP_FC_WAIT:
                     # Wait before continuing
                     continue
+            else:
+                print("ISO-TP: timed out waiting for Flow Control", file=sys.stderr)
+                return False
 
             # Send Consecutive Frame
             cf_header = struct.pack("B", ISO_TP_CF | (sn & 0x0F))
@@ -108,16 +122,16 @@ class IsoTpStack(object):
 
         return True
 
-    def receive(self, timeout=5.0):
+    def receive(self, timeout=5.0, extflag=False):
         """Wait for and assemble an incoming ISO-TP message.
 
         Returns ``None`` on timeout. Otherwise returns raw response data bytes.
         """
-        first_frame = self._transport.recv_raw_can(timeout=timeout)
+        first_frame = self._recv_from_ecu(timeout=timeout)
         if first_frame is None:
             return None
 
-        arbid, frame_data, extflag = first_frame
+        arbid, frame_data, frame_extflag = first_frame
         pci_byte = frame_data[0]
         pci_type = (pci_byte & 0xF0) >> 4
 
@@ -128,19 +142,36 @@ class IsoTpStack(object):
 
         elif pci_type == 0x1:
             # -- First Frame (multi-frame) ------------------------------------
-            total_length = struct.unpack("!H", frame_data[1:3])[0]
-            accumulated = bytearray(frame_data[3:])  # first 6 bytes of data
+            # 2-byte PCI: 12-bit length in (byte0 low nibble, byte1); a
+            # length of 0 there means the escape form -- a 4-byte length
+            # follows in bytes 2-5, leaving only 2 data bytes (see send()).
+            ff_dl = ((pci_byte & 0x0F) << 8) | frame_data[1]
+            if ff_dl == 0:
+                total_length = struct.unpack(">I", frame_data[2:6])[0]
+                accumulated = bytearray(frame_data[6:])
+            else:
+                total_length = ff_dl
+                accumulated = bytearray(frame_data[2:])  # first 6 bytes of data
 
-            sn = 0  # expected sequence number for next CF
+            sn = 1  # expected sequence number for next CF (CF[1] is first)
+
+            # Tell the ECU we're ready to receive the Consecutive Frames --
+            # without this the ECU just times out and never sends them.
+            self._send_flow_control(extflag=extflag)
 
             while len(accumulated) < total_length:
-                cf_frame = self._transport.recv_raw_can(timeout=2.0)
+                cf_frame = self._recv_from_ecu(timeout=2.0)
                 if cf_frame is None:
                     break
                 _, cf_data, _ = cf_frame
+                cf_pci_type = (cf_data[0] & 0xF0) >> 4
+                if cf_pci_type != 0x2:
+                    # Not a Consecutive Frame (stray/duplicate traffic on our
+                    # rx id) -- ignore and keep waiting for the real one.
+                    continue
                 cf_sn = cf_data[0] & 0x0F
 
-                if cf_sn != sn:
+                if cf_sn != (sn & 0x0F):
                     print("ISO-TP consecutive frame sequence error", file=sys.stderr)
                     return None
 
@@ -150,9 +181,34 @@ class IsoTpStack(object):
             else:
                 return bytes(accumulated[:total_length])
 
+            # Loop was broken out of (timeout) rather than completing
+            return None
+
         elif pci_type == 0x3:
-            # -- Response to a request the ECU sent to us; send FC --------------
-            self._send_flow_control()
+            # A Flow Control frame is not a valid response payload here --
+            # we're the one receiving a response, not sending one.  Ignore it.
+            print("ISO-TP: unexpected Flow Control frame while awaiting response", file=sys.stderr)
+            return None
+
+    def _recv_from_ecu(self, timeout):
+        """Wait up to ``timeout`` seconds for a frame addressed to our rx id.
+
+        Any other traffic on the bus (our own echoed tx frames, other ECUs,
+        etc.) is discarded so it can't be mistaken for part of this
+        transaction.
+        """
+        deadline = time.time() + timeout
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                return None
+            frame = self._transport.recv_raw_can(timeout=remaining)
+            if frame is None:
+                return None
+            arbid, frame_data, extflag = frame
+            if arbid == self._rx_id:
+                return frame
+            # not addressed to us -- keep waiting for the rest of the budget
 
     def _parse_flow_control(self, frame_data):
         """Parse and extract flow control parameters.
@@ -184,10 +240,11 @@ class IsoTpStack(object):
             centiseconds = (raw - 0xF1 + 100)
             return int(centiseconds * 10e3)   # cs to us
 
-    def _send_flow_control(self):
-        """Send a Flow Control message back to the ECU."""
+    def _send_flow_control(self, extflag=False):
+        """Send a Flow Control (clear-to-send) frame back to the ECU."""
         fc_frame = struct.pack("BBB",
                                ISO_TP_FC | ISO_TP_FC_CONTINUE,
                                self._fc_bs,                 # block size
                                self._fc_st_min              # STmin
-                              )[:8]  # pad to 8 bytes for CAN frame
+                              )
+        self._transport.send_raw_can(self._tx_id, fc_frame, extflag=extflag)

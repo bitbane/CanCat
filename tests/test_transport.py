@@ -116,10 +116,11 @@ class FakeCanBus:
     _send_queue = []   # fake rx frames injected from outside
     _sent_frames = []  # record of sent frames for assertions
     
-    def __init__(self, channel="can0", bustype="socketcan", bitrate=500000):
+    def __init__(self, channel="can0", bustype="socketcan", bitrate=500000, receive_own_messages=False):
         self.channel = channel
         self.bustype = bustype
         self.bitrate = bitrate
+        self.receive_own_messages = receive_own_messages
         self._alive = True
 
     def send(self, msg):
@@ -278,6 +279,51 @@ class TestSocketcanTransport(unittest.TestCase):
         self.assertIsNone(result)
         self.t.close()
 
+    # ------------------------------------------------------------------
+    #  subscribe() fan-out
+    # ------------------------------------------------------------------
+
+    def test_subscribers_each_get_their_own_copy_of_a_frame(self):
+        """Two independent consumers (e.g. the logging thread and an
+        in-flight ISO-TP transaction) must each see every frame -- neither
+        should be able to steal it from the other."""
+        self.t.open()
+        try:
+            sub_a = self.t.subscribe()
+            sub_b = self.t.subscribe()
+
+            with self.t._lock_cond:
+                entry = (0x7E8, b"\x10\x14\x62\xF1\x90\x31", False)
+                self.t._recv_queue.append(entry)
+                self.t._lock_cond.notify()
+                for handle in self.t._subscribers:
+                    with handle["cond"]:
+                        handle["queue"].append(entry)
+                        handle["cond"].notify()
+
+            result_a = sub_a.recv_raw_can(timeout=1.0)
+            result_b = sub_b.recv_raw_can(timeout=1.0)
+            self.assertEqual(result_a, entry)
+            self.assertEqual(result_b, entry)
+        finally:
+            self.t.close()
+
+    def test_unsubscribe_stops_delivery(self):
+        self.t.open()
+        try:
+            sub = self.t.subscribe()
+            sub.close()
+            self.assertEqual(self.t._subscribers, [])
+        finally:
+            self.t.close()
+
+    def test_open_enables_receive_own_messages(self):
+        self.t.open()
+        try:
+            self.assertTrue(self.t._bus.receive_own_messages)
+        finally:
+            self.t.close()
+
 
 # =====================================================================
 #  IsoTpStack tests
@@ -309,7 +355,10 @@ class TestIsoTpStack(unittest.TestCase):
 
     def setUp(self):
         self.t = MockTransportForIsoTP()
-        self.stack = IsoTpStack(self.t)
+        # rx_id/tx_id match the 0x7E8 arbid used by the frames below so the
+        # stack's arbid filtering (it discards anything not addressed to
+        # rx_id) doesn't throw away the test's injected frames.
+        self.stack = IsoTpStack(self.t, rx_id=0x7E8, tx_id=0x7E0)
 
     # ------------------------------------------------------------------
     #  Single Frame send (<=6 bytes payload)
@@ -387,31 +436,90 @@ class TestIsoTpStack(unittest.TestCase):
         total_len = 20
         data_payload = os.urandom(total_len)
         
-        # First Frame: [0x10, len_hi, len_lo, <first 6 bytes>]
-        ff_pci = struct.pack("!BH", 0x10, total_len)
+        # First Frame: 2-byte PCI per ISO 15765-2 -- top nibble of byte 0 is
+        # the FF type, bottom nibble + byte 1 hold the 12-bit length -- then
+        # <first 6 bytes>.
+        ff_pci = struct.pack("BB", 0x10 | ((total_len >> 8) & 0x0F), total_len & 0xFF)
         ff_frame = (0x7E8, ff_pci + data_payload[:6], False)
         
-        # Consecutive Frames: [SN | 0xF0, <up to 7 bytes>]
-        # Stack expects first CF SN=0 (line 135 in isotp_stack.py)
+        # Consecutive Frames: [0x20 | SN, <up to 7 bytes>] -- ISO 15765-2 CF
+        # type nibble is 0x2, and SN starts at 1 for the first CF.
         cf_frames = []
-        sn = 0
+        sn = 1
         offset = 6
         while offset < total_len:
             chunk = data_payload[offset:offset + 7]
-            cf_frame = (0x7E8, struct.pack("B", (sn & 0xF) | 0x30) + chunk, False)
+            cf_frame = (0x7E8, struct.pack("B", 0x20 | (sn & 0xF)) + chunk, False)
             cf_frames.append(cf_frame)
             sn = (sn + 1) & 0xF
             offset += 7
-        
+
         # Mock transport: inject_recv() uses insert(0), recv_raw_can() uses pop(0).
         # To get FIFO output [FF, CF1, CF2], queue must be [FF, CF1, CF2].
         # Achieve with: inject reverse-CFs first (so earliest CF ends up at front), then FF last.
         for cf in reversed(cf_frames):     # cf_frames is [CF1, CF2,...] → reversed puts them in right order after prepends
             self.t.inject_recv(cf)
         self.t.inject_recv(ff_frame)       # injected last = pops first from index 0
-        
+
         result = self.stack.receive(timeout=3.0)
         self.assertEqual(result, data_payload[:total_len])
+
+        # receive() must send a Flow Control frame right after the First
+        # Frame so the ECU knows to keep sending Consecutive Frames --
+        # without it a real ECU just times out and never sends them.
+        self.assertEqual(len(self.t._send_log), 1)
+        fc_arbid, fc_data, _ = self.t._send_log[0]
+        self.assertEqual(fc_arbid, 0x7E0)  # our tx_id
+        self.assertEqual((fc_data[0] & 0xF0) >> 4, 0x3)  # FC type
+        self.assertEqual(fc_data[0] & 0x0F, 0x0)  # ContinueToSend
+
+    def test_receive_multiframe_ignores_frames_for_other_arbids(self):
+        """Frames not addressed to our rx_id (e.g. other bus traffic, or our
+        own echoed tx frame when receive_own_messages is enabled) must not
+        be mistaken for part of this transaction."""
+        total_len = 20
+        data_payload = os.urandom(total_len)
+
+        ff_pci = struct.pack("BB", 0x10 | ((total_len >> 8) & 0x0F), total_len & 0xFF)
+        ff_frame = (0x7E8, ff_pci + data_payload[:6], False)
+
+        cf_frames = []
+        sn = 1
+        offset = 6
+        while offset < total_len:
+            chunk = data_payload[offset:offset + 7]
+            cf_frames.append((0x7E8, struct.pack("B", 0x20 | (sn & 0xF)) + chunk, False))
+            sn = (sn + 1) & 0xF
+            offset += 7
+
+        # Interleave unrelated frames (e.g. our own echoed request, or
+        # another ECU's chatter) ahead of each real frame.
+        stray = (0x7E0, b"\x03\x22\xF1\x90", False)  # our own echoed request
+        other_ecu = (0x123, b"\x00" * 8, False)
+
+        self.t.inject_recv(other_ecu)
+        for cf in reversed(cf_frames):
+            self.t.inject_recv(cf)
+            self.t.inject_recv(stray)
+        self.t.inject_recv(ff_frame)
+        self.t.inject_recv(stray)
+
+        result = self.stack.receive(timeout=3.0)
+        self.assertEqual(result, data_payload[:total_len])
+
+    def test_receive_multiframe_real_ecu_bytes(self):
+        """Regression test using the exact frame bytes captured off a real
+        ECU's ReadDataByIdentifier(0xF190) response -- a First Frame whose
+        2-byte PCI (0x10 0x14) must decode to length 20, not be misread as a
+        3-byte PCI (which previously misparsed the length as 0x1462)."""
+        # inject_recv() prepends, so inject in reverse order to get the
+        # real FIFO wire order [FF, CF1, CF2] back out of recv_raw_can().
+        self.t.inject_recv((0x7E8, bytes.fromhex("22ffffffffffffff"), False))
+        self.t.inject_recv((0x7E8, bytes.fromhex("21ffffffffffffff"), False))
+        self.t.inject_recv((0x7E8, bytes.fromhex("101462f190ffffff"), False))
+
+        result = self.stack.receive(timeout=3.0)
+        self.assertEqual(result, bytes.fromhex("62f190") + b"\xff" * 17)
 
     # ------------------------------------------------------------------
     #  Receive timeout

@@ -9,6 +9,11 @@ import struct
 import sys
 import threading
 
+try:
+    import can  # python-can; only required for the socketcan transport
+except ImportError:
+    can = None
+
 
 class Transport(object):
     """Abstract base class for CAN communication."""
@@ -106,11 +111,21 @@ class SocketcanTransport(Transport):
         self._lock_cond = threading.Condition()
         self._rx_thread = None
         self._running = False
+        self._subscribers = []        # list of {"queue": [...], "cond": Condition()}
 
     def open(self):
         """Start the SocketCAN bus and background rx thread."""
-        import can  # python-can
-        self._bus = can.Bus(channel=self.channel, bustype="socketcan", bitrate=self._bitrate)
+        if can is None:
+            raise ImportError(
+                "python-can is required for socketcan transport. "
+                "Install it with: pip install python-can"
+            )
+        # receive_own_messages so our own transmitted frames get looped back
+        # through the same rx path -- this is what makes sent CAN/UDS
+        # traffic show up in printCanMsgs(), mirroring how the custom
+        # firmware sees its own transmissions reflected on the physical bus.
+        self._bus = can.Bus(channel=self.channel, bustype="socketcan",
+                             bitrate=self._bitrate, receive_own_messages=True)
         self._running = True
         self._rx_thread = threading.Thread(target=self._rx_loop, daemon=True)
         self._rx_thread.start()
@@ -141,12 +156,58 @@ class SocketcanTransport(Transport):
         self._bus.send(can_msg)
 
     def recv_raw_can(self, timeout: float = 1.0):
-        """Wait for next (arbid, data_bytes, extflag) from rx queue."""
+        """Wait for next (arbid, data_bytes, extflag) from the default rx queue.
+
+        This is a single shared queue -- if more than one consumer needs to
+        read frames concurrently (e.g. the background message logger *and*
+        an ISO-TP transaction), use :meth:`subscribe` instead so each
+        consumer gets its own private copy of every frame rather than the
+        two of them stealing frames from each other.
+        """
         with self._lock_cond:
             if not self._recv_queue:
                 ready = self._lock_cond.wait(timeout=timeout)
             if self._recv_queue:
                 return self._recv_queue.pop(0)
+            return None
+
+    # -- fan-out subscriptions ------------------------------------------
+    #
+    # A single can.Bus is shared by everything that talks to this channel:
+    # the background thread that records frames for printCanMsgs(), and any
+    # in-flight ISO-TP transaction that needs to see FC/CF frames.  If they
+    # all pulled from one queue via recv_raw_can(), whichever one happened
+    # to be waiting would "steal" each frame from the others.  subscribe()
+    # instead hands out a view that receives its own private copy of every
+    # incoming frame.
+
+    def subscribe(self):
+        """Return a transport-like view with its own private fan-out queue.
+
+        The returned object exposes ``send_raw_can``/``recv_raw_can`` (just
+        like this transport) so it can be handed to anything that expects a
+        Transport, e.g. :class:`cancatlib.isotp_stack.IsoTpStack`. Call
+        ``.close()`` on it when done to stop receiving frames.
+        """
+        handle = {"queue": [], "cond": threading.Condition()}
+        with self._lock_cond:
+            self._subscribers.append(handle)
+        return _Subscription(self, handle)
+
+    def unsubscribe(self, handle):
+        with self._lock_cond:
+            if handle in self._subscribers:
+                self._subscribers.remove(handle)
+
+    def recv_subscribed(self, handle, timeout: float = 1.0):
+        """Wait for the next frame fanned out to ``handle`` (see subscribe())."""
+        cond = handle["cond"]
+        queue = handle["queue"]
+        with cond:
+            if not queue:
+                cond.wait(timeout=timeout)
+            if queue:
+                return queue.pop(0)
             return None
 
     # -- background receiver ------------------------------------------
@@ -162,7 +223,35 @@ class SocketcanTransport(Transport):
                     with self._lock_cond:
                         self._recv_queue.append(entry)
                         self._lock_cond.notify()
+                        subscribers = list(self._subscribers)
+                    for handle in subscribers:
+                        with handle["cond"]:
+                            handle["queue"].append(entry)
+                            handle["cond"].notify()
             except Exception as e:
                 if self._running:
                     import sys
                     print(f"SocketCAN rx error: {e}", file=sys.stderr, flush=True)
+
+
+class _Subscription:
+    """A private, per-consumer view onto a :class:`SocketcanTransport`.
+
+    Satisfies the same ``send_raw_can``/``recv_raw_can`` interface as a
+    Transport, but ``recv_raw_can`` reads from a dedicated fan-out queue
+    (see :meth:`SocketcanTransport.subscribe`) instead of the shared default
+    queue, so it never competes with other consumers for frames.
+    """
+
+    def __init__(self, transport: "SocketcanTransport", handle):
+        self._transport = transport
+        self._handle = handle
+
+    def send_raw_can(self, arbid: int, data: bytes, extflag: bool = False):
+        return self._transport.send_raw_can(arbid, data, extflag=extflag)
+
+    def recv_raw_can(self, timeout: float = 1.0):
+        return self._transport.recv_subscribed(self._handle, timeout=timeout)
+
+    def close(self):
+        self._transport.unsubscribe(self._handle)

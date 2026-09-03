@@ -383,22 +383,33 @@ class CanInterface(object):
         '''
         Background thread for socketcan transport. Reads CAN frames from the
         transport layer and submits them to the CMD_CAN_RECV mailbox.
+
+        Uses its own subscription (see SocketcanTransport.subscribe()) so it
+        gets a private copy of every frame instead of competing with an
+        in-flight IsoTpStack transaction for frames off a single shared
+        queue -- otherwise whichever of the two happened to be waiting would
+        steal frames (e.g. an ISO-TP First Frame) away from the other.
         '''
-        while not self._config['shutdown']:
-            if not self._transport:
-                time.sleep(0.1)
-                continue
-            try:
-                frame = self._transport.recv_raw_can(timeout=1.0)
-                if frame is None:
+        sub = self._transport.subscribe() if hasattr(self._transport, 'subscribe') else self._transport
+        try:
+            while not self._config['shutdown']:
+                if not self._transport:
+                    time.sleep(0.1)
                     continue
-                arbid, data_bytes, extflag = frame
-                ts = time.time()
-                msg = struct.pack('>I', arbid) + data_bytes
-                self._submitMessage(CMD_CAN_RECV, (ts, msg))
-            except Exception as e:
-                if not self._config['shutdown']:
-                    print("SocketCAN rx error: %r" % e)
+                try:
+                    frame = sub.recv_raw_can(timeout=1.0)
+                    if frame is None:
+                        continue
+                    arbid, data_bytes, extflag = frame
+                    ts = time.time()
+                    msg = struct.pack('>I', arbid) + data_bytes
+                    self._submitMessage(CMD_CAN_RECV, (ts, msg))
+                except Exception as e:
+                    if not self._config['shutdown']:
+                        print("SocketCAN rx error: %r" % e)
+        finally:
+            if sub is not self._transport and hasattr(sub, 'close'):
+                sub.close()
 
     def clearCanMsgs(self):
         '''
@@ -682,9 +693,18 @@ class CanInterface(object):
 
         if self.transport_mode == 'socketcan':
             from cancatlib.isotp_stack import IsoTpStack
-            stack = IsoTpStack(self._transport, rx_id=rx_arbid, tx_id=tx_arbid)
-            for i in range(count):
-                result = stack.send(tx_arbid, message, extflag=bool(extflag))
+            # Use a private subscription so this transaction's FC/CF frames
+            # aren't stolen by (or steal from) the background logging
+            # thread reading off the same transport -- see
+            # SocketcanTransport.subscribe().
+            sub = self._transport.subscribe() if hasattr(self._transport, 'subscribe') else self._transport
+            try:
+                stack = IsoTpStack(sub, rx_id=rx_arbid, tx_id=tx_arbid)
+                for i in range(count):
+                    result = stack.send(tx_arbid, message, extflag=bool(extflag))
+            finally:
+                if sub is not self._transport and hasattr(sub, 'close'):
+                    sub.close()
             return 0 if result else 1
 
         msg = struct.pack('>IIB', tx_arbid, rx_arbid, extflag) + message
@@ -753,11 +773,20 @@ class CanInterface(object):
 
         if self.transport_mode == 'socketcan':
             from cancatlib.isotp_stack import IsoTpStack
-            stack = IsoTpStack(self._transport, rx_id=rx_arbid, tx_id=tx_arbid)
-            for i in range(count):
-                result = stack.send(tx_arbid, message, extflag=bool(extflag))
-            # Now receive response
-            resp_data = stack.receive(timeout=min(timeout * 2, 15.0))
+            # Use a private subscription so this transaction's FF/CF/FC
+            # frames aren't stolen by (or steal from) the background
+            # logging thread reading off the same transport -- see
+            # SocketcanTransport.subscribe().
+            sub = self._transport.subscribe() if hasattr(self._transport, 'subscribe') else self._transport
+            try:
+                stack = IsoTpStack(sub, rx_id=rx_arbid, tx_id=tx_arbid)
+                for i in range(count):
+                    result = stack.send(tx_arbid, message, extflag=bool(extflag))
+                # Now receive response
+                resp_data = stack.receive(timeout=min(timeout * 2, 15.0), extflag=bool(extflag))
+            finally:
+                if sub is not self._transport and hasattr(sub, 'close'):
+                    sub.close()
             return resp_data, None
 
         currIdx = self.getCanMsgCount()
@@ -936,7 +965,16 @@ class CanInterface(object):
         '''
         set the baud rate for the CAN bus.  this has nothing to do with the
         connection from the computer to the tool
+
+        This is only meaningful for the custom CanCat firmware, which has to
+        be told what speed to run the CAN bus at.  A socketcan interface is
+        configured externally (e.g. via `ip link set can0 up type can
+        bitrate ...`) before CanCat ever touches it, so there is no firmware
+        to talk to and this is a no-op in that mode.
         '''
+        if self.transport_mode == 'socketcan':
+            self._config['can_baud'] = baud_const
+            return
 
         baud = struct.pack("B", baud_const)
 
