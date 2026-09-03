@@ -2294,7 +2294,6 @@ cs = []
 
 
 def cleanupInteractiveAtExit():
-    global cs
     for c in cs:
         try:
             c.__del__()
