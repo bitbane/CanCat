@@ -6,7 +6,6 @@ SocketCAN mode, where the underlying kernel does not handle ISO-TP natively.
 Used by CanCat when communicating via SocketCAN to send and receive ECU
 messages larger than 8 bytes (UDS diagnostic requests/responses).
 """
-from __future__ import print_function
 import struct
 import sys
 import threading

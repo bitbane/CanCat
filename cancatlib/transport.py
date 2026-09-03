@@ -4,7 +4,6 @@ Provides a common interface for serial and socketcan backends so that
 higher-level CAN methods (CanInterface) can work identically regardless of
 the underlying physical medium.  No existing serial behaviour is changed.
 """
-from __future__ import print_function
 import select
 import struct
 import sys
