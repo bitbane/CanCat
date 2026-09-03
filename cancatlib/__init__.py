@@ -814,13 +814,29 @@ class CanInterface(object):
         if resval != 0:
             print('ISOTPxmit() failed: %s' % CAN_RESPS.get(resval))
 
-        msg, idx = self._isotp_get_msg(rx_arbid, start_index=currIdx, service=service, timeout=timeout)
+        msg, idx = self._isotp_get_msg(rx_arbid, start_index=currIdx, service=service, timeout=timeout, tx_arbid=tx_arbid)
         return msg, idx
 
-    def _isotp_get_msg(self, rx_arbid, start_index=0, service=None, timeout=None):
+    def _isotp_get_msg(self, rx_arbid, start_index=0, service=None, timeout=None, tx_arbid=None):
         '''
         Internal Method to piece together a valid ISO-TP message from received CAN packets.
+
+        For socketcan: waits for the next ISO-TP message on rx_arbid via
+        IsoTpStack -- used e.g. by UDS.xmit_recv() to wait for the real
+        response after a ResponseCorrectlyReceivedResponsePending (NRC
+        0x78). start_index is a serial/firmware-mailbox concept (a position
+        to resume scanning from) that doesn't apply here, so it's ignored.
         '''
+        if self.transport_mode == 'socketcan':
+            from cancatlib.isotp_stack import IsoTpStack
+            sub = self._transport.subscribe() if hasattr(self._transport, 'subscribe') else self._transport
+            try:
+                stack = IsoTpStack(sub, rx_id=rx_arbid, tx_id=tx_arbid)
+                msg = stack.receive(timeout=timeout or 15.0)
+            finally:
+                if sub is not self._transport and hasattr(sub, 'close'):
+                    sub.close()
+            return msg, None
 
         found = False
         complete = False
