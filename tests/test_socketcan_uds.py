@@ -116,6 +116,28 @@ class TestSocketcanUdsResponsePending(unittest.TestCase):
             c._config['shutdown'] = True
             c._transport.close()
 
+    def test_isotprecv_calls_isotp_get_msg(self):
+        """Regression test: ISOTPrecv() called self._getIsoTpMsg(), a method
+        that has never existed (it's _isotp_get_msg, underscore-prefixed) --
+        an AttributeError on every call, since day one of this file back in
+        2022. Broken independent of transport, but exercised here over
+        socketcan since that's this test module's fixture."""
+        from cancatlib import CanInterface
+
+        c = CanInterface(port='FakeCanCat', transport='socketcan', socketcan_iface='vcan0')
+        try:
+            def send_later():
+                time.sleep(0.1)
+                FakeCanBus._send_queue.append(FakeCanMessage(0x7c8, bytes.fromhex('036edead00000000')))
+            threading.Thread(target=send_later, daemon=True).start()
+
+            msg, idx = c.ISOTPrecv(0x7c0, 0x7c8, timeout=2.0)
+            self.assertEqual(msg, bytes.fromhex('6edead'))
+            self.assertIsNone(idx)  # no mailbox position under socketcan
+        finally:
+            c._config['shutdown'] = True
+            c._transport.close()
+
     def test_write_did_survives_response_pending(self):
         """Regression test: a real ECU replying with NRC 0x78
         (ResponseCorrectlyReceivedResponsePending) before its real answer

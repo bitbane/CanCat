@@ -746,9 +746,9 @@ class CanInterface(object):
         # set the CANCat to respond to Flow Control messages
         resval = self._isotp_enable_flowcontrol(tx_arbid, rx_arbid, extflag)
 
-        msg = self._getIsoTpMsg(rx_arbid, start_index=start_msg_idx, timeout=timeout)
+        msg, idx = self._isotp_get_msg(rx_arbid, start_index=start_msg_idx, timeout=timeout)
 
-        return msg
+        return msg, idx
 
     def _isotp_enable_flowcontrol(self, tx_arbid, rx_arbid, extflag=0, timeout=3):
         '''
