@@ -55,7 +55,7 @@ def reprExtMsgs(msgs):
     for arbtup, msg in msgs.get('msgs'):
         out.append(msg[1:].hex())
 
-    data = ''.join(out[1:]).decode('hex')
+    data = bytes.fromhex(''.join(out[1:]))
     strings = getAscii(data)
 
     if len(strings):
